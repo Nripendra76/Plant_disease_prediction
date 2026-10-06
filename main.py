@@ -30,8 +30,36 @@ def model_prediction(test_image):
     # Prediction
     predictions = model.predict(input_arr, verbose=0)
 
-    # Return index of maximum prediction
-    return np.argmax(predictions)
+    # Return index of maximum prediction AND its confidence score
+    result_index = np.argmax(predictions)
+    confidence = float(np.max(predictions))
+    return result_index, confidence
+
+
+def is_likely_plant_image(uploaded_file):
+    """
+    Basic heuristic to check if an image likely contains a plant/leaf.
+    Checks if a minimum percentage of pixels have green as the dominant
+    color channel, which is typical for plant/leaf images.
+    Returns True if the image appears to be a plant, False otherwise.
+    """
+    image = Image.open(uploaded_file).convert("RGB")
+    image = image.resize((128, 128))  # Resize for faster processing
+    img_array = np.array(image, dtype=np.float32)
+
+    r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
+
+    # A pixel is "green-ish" if the green channel is notably higher than
+    # both red and blue, or the image has earthy/plant tones
+    green_dominant = (g > r) & (g > b) & (g > 40)
+    brown_green = (g > 40) & (r > 30) & (b < r) & (g > b)  # Earthy plant tones
+    plant_pixels = green_dominant | brown_green
+
+    plant_ratio = np.sum(plant_pixels) / plant_pixels.size
+
+    # If at least 8% of pixels look plant-like, consider it a plant image
+    # This is a lenient threshold to avoid false rejections
+    return plant_ratio > 0.08
 
 
 # Class names
@@ -560,58 +588,86 @@ elif app_mode == "Disease Recognition":
 
             st.snow()
 
-            result_index = model_prediction(test_image)
+            # Check if the image looks like a plant/leaf
+            test_image.seek(0)  # Reset file pointer
+            plant_check = is_likely_plant_image(test_image)
+            test_image.seek(0)  # Reset file pointer again for model
 
-            # Parse the predicted class name
-            predicted_class = class_name[result_index]
-            parts = predicted_class.split("___")
-            plant_name = parts[0].replace("_", " ")
-            condition = parts[1].replace("_", " ") if len(parts) > 1 else "Unknown"
+            result_index, confidence = model_prediction(test_image)
+            test_image.seek(0)  # Reset for displaying
 
-            st.write("### Our Prediction")
+            # Confidence threshold — if the model is unsure, the image
+            # is likely not a valid plant leaf
+            CONFIDENCE_THRESHOLD = 0.50
 
-            if "healthy" in predicted_class.lower():
-                # Healthy plant — show image and success message
+            if confidence < CONFIDENCE_THRESHOLD or not plant_check:
+                # Irrelevant image detected — warn the user
                 st.image(
                     test_image,
                     caption="Uploaded Image",
                     width="stretch"
                 )
-                st.success(
-                    f"✅ The **{plant_name}** plant looks **Healthy**! "
-                    "No disease detected."
+                st.warning(
+                    "⚠️ **This doesn't look like a valid plant leaf image!**\n\n"
+                    "Please upload a clear image of a **plant leaf** for accurate disease detection.\n\n"
+                    "**Tips for best results:**\n"
+                    "- Upload a close-up photo of a single leaf\n"
+                    "- Make sure the leaf is clearly visible and well-lit\n"
+                    "- Avoid uploading images of non-plant objects (cars, people, animals, etc.)\n\n"
+                    f"*Model confidence: {confidence * 100:.1f}%*"
                 )
-                # Show care tips
-                info = disease_info.get(predicted_class, None)
-                if info:
-                    st.info("💡 **Care Tips:**")
-                    for tip in info['solution']:
-                        st.markdown(f"- {tip}")
             else:
-                # Diseased plant — two-column layout
-                col_left, col_right = st.columns([1, 1])
+                # Valid plant image — proceed with prediction
+                # Parse the predicted class name
+                predicted_class = class_name[result_index]
+                parts = predicted_class.split("___")
+                plant_name = parts[0].replace("_", " ")
+                condition = parts[1].replace("_", " ") if len(parts) > 1 else "Unknown"
 
-                with col_left:
+                st.write("### Our Prediction")
+
+                if "healthy" in predicted_class.lower():
+                    # Healthy plant — show image and success message
                     st.image(
                         test_image,
                         caption="Uploaded Image",
                         width="stretch"
                     )
-
-                with col_right:
-                    st.error(
-                        f"⚠️ **Disease Detected!**\n\n"
-                        f"**Plant:** {plant_name}\n\n"
-                        f"**Disease:** {condition}"
+                    st.success(
+                        f"✅ The **{plant_name}** plant looks **Healthy**! "
+                        "No disease detected."
                     )
-
+                    # Show care tips
                     info = disease_info.get(predicted_class, None)
                     if info:
-                        st.markdown("---")
-                        st.markdown(f"🦠 **Cause:**\n\n{info['cause']}")
-                        st.markdown(f"🔍 **Symptoms:**\n\n{info['symptoms']}")
-                        st.markdown("💊 **Recommended Solutions:**")
-                        for i, sol in enumerate(info['solution'], 1):
-                            st.markdown(f"{i}. {sol}")
+                        st.info("💡 **Care Tips:**")
+                        for tip in info['solution']:
+                            st.markdown(f"- {tip}")
+                else:
+                    # Diseased plant — two-column layout
+                    col_left, col_right = st.columns([1, 1])
+
+                    with col_left:
+                        st.image(
+                            test_image,
+                            caption="Uploaded Image",
+                            width="stretch"
+                        )
+
+                    with col_right:
+                        st.error(
+                            f"⚠️ **Disease Detected!**\n\n"
+                            f"**Plant:** {plant_name}\n\n"
+                            f"**Disease:** {condition}"
+                        )
+
+                        info = disease_info.get(predicted_class, None)
+                        if info:
+                            st.markdown("---")
+                            st.markdown(f"🦠 **Cause:**\n\n{info['cause']}")
+                            st.markdown(f"🔍 **Symptoms:**\n\n{info['symptoms']}")
+                            st.markdown("💊 **Recommended Solutions:**")
+                            for i, sol in enumerate(info['solution'], 1):
+                                st.markdown(f"{i}. {sol}")
     else:
         st.info("📤 Please upload a plant leaf image to get started.")
