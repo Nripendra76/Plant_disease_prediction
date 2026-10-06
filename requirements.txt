@@ -1,0 +1,8 @@
+streamlit
+tensorflow==2.15.0
+pillow
+pandas
+matplotlib
+seaborn
+cv2
+numpy<2
