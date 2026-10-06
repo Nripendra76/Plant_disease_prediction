@@ -36,30 +36,103 @@ def model_prediction(test_image):
     return result_index, confidence
 
 
-def is_likely_plant_image(uploaded_file):
+def validate_plant_image(uploaded_file):
     """
-    Basic heuristic to check if an image likely contains a plant/leaf.
-    Checks if a minimum percentage of pixels have green as the dominant
-    color channel, which is typical for plant/leaf images.
-    Returns True if the image appears to be a plant, False otherwise.
+    Multi-layered validation to check if the uploaded image is actually
+    a plant/leaf and not an irrelevant object (car, person, building, etc.).
+
+    Uses three checks:
+      1. HSV color analysis — real leaves have specific green/yellow-green/brown hues
+      2. Natural texture — leaves have organic texture variance, not smooth like objects
+      3. Prediction consistency — model should predict the same class on original & flipped
+
+    Returns (is_valid, reason) tuple.
     """
     image = Image.open(uploaded_file).convert("RGB")
-    image = image.resize((128, 128))  # Resize for faster processing
+    image = image.resize((128, 128))
     img_array = np.array(image, dtype=np.float32)
 
-    r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
+    # ─── CHECK 1: HSV-based leaf color analysis ───
+    # Convert RGB (0-255) to HSV manually
+    img_norm = img_array / 255.0
+    r, g, b = img_norm[:, :, 0], img_norm[:, :, 1], img_norm[:, :, 2]
 
-    # A pixel is "green-ish" if the green channel is notably higher than
-    # both red and blue, or the image has earthy/plant tones
-    green_dominant = (g > r) & (g > b) & (g > 40)
-    brown_green = (g > 40) & (r > 30) & (b < r) & (g > b)  # Earthy plant tones
-    plant_pixels = green_dominant | brown_green
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    diff = cmax - cmin
 
-    plant_ratio = np.sum(plant_pixels) / plant_pixels.size
+    # Hue calculation (in degrees, 0-360)
+    hue = np.zeros_like(cmax)
+    mask = diff > 0.01  # Avoid division by zero
 
-    # If at least 8% of pixels look plant-like, consider it a plant image
-    # This is a lenient threshold to avoid false rejections
-    return plant_ratio > 0.08
+    # When green is max → hue in green range
+    green_max = mask & (cmax == g)
+    hue[green_max] = 60 * (((b[green_max] - r[green_max]) / diff[green_max]) + 2)
+
+    # When red is max
+    red_max = mask & (cmax == r)
+    hue[red_max] = 60 * (((g[red_max] - b[red_max]) / diff[red_max]) % 6)
+
+    # When blue is max
+    blue_max = mask & (cmax == b)
+    hue[blue_max] = 60 * (((r[blue_max] - g[blue_max]) / diff[blue_max]) + 4)
+
+    hue = hue % 360  # Ensure 0-360 range
+
+    # Saturation and Value
+    saturation = np.where(cmax > 0.01, diff / cmax, 0)
+    value = cmax
+
+    # Leaf-green: hue 60-170°, with decent saturation and not too dark
+    leaf_green = (hue >= 50) & (hue <= 170) & (saturation > 0.12) & (value > 0.15)
+
+    # Yellow-green / stressed leaves: hue 30-60°
+    yellow_green = (hue >= 25) & (hue < 50) & (saturation > 0.15) & (value > 0.2)
+
+    # Brown / diseased leaves: hue 10-40°, moderate saturation
+    brown_leaf = (hue >= 8) & (hue < 40) & (saturation > 0.20) & (value > 0.12) & (value < 0.75)
+
+    plant_pixels = leaf_green | yellow_green | brown_leaf
+    plant_ratio = float(np.sum(plant_pixels)) / plant_pixels.size
+
+    # Need at least 15% of image to be plant-colored
+    if plant_ratio < 0.15:
+        return False, "color"
+
+    # ─── CHECK 2: Natural texture variance ───
+    # Leaves have organic textures (veins, spots, edges) creating moderate
+    # pixel-level variance. Smooth man-made objects (car paint, walls) have
+    # very low variance. Compute local variance in the green channel.
+    g_channel = img_array[:, :, 1]  # Green channel (0-255)
+
+    # Calculate variance using a simple method: difference from shifted versions
+    # This captures local edge/texture information
+    diff_h = np.abs(g_channel[:, 1:] - g_channel[:, :-1])  # Horizontal edges
+    diff_v = np.abs(g_channel[1:, :] - g_channel[:-1, :])  # Vertical edges
+    avg_texture = (np.mean(diff_h) + np.mean(diff_v)) / 2.0
+
+    # Real leaf images typically have texture score > 5 (veins, disease spots, etc.)
+    # Smooth objects like cars, walls, etc. score much lower in plant-colored regions
+    # Use a lenient threshold to avoid rejecting smooth healthy leaves
+    if avg_texture < 3.0:
+        return False, "texture"
+
+    # ─── CHECK 3: Prediction consistency ───
+    # A real leaf should get the SAME prediction when flipped horizontally.
+    # Random non-plant objects often get different predictions on augmentations.
+    original = np.expand_dims(np.array(image.resize((128, 128))) , axis=0)
+    flipped = np.expand_dims(np.array(image.resize((128, 128)).transpose(Image.FLIP_LEFT_RIGHT)), axis=0)
+
+    pred_original = model.predict(original, verbose=0)
+    pred_flipped = model.predict(flipped, verbose=0)
+
+    class_original = np.argmax(pred_original)
+    class_flipped = np.argmax(pred_flipped)
+
+    if class_original != class_flipped:
+        return False, "consistency"
+
+    return True, "passed"
 
 
 # Class names
@@ -588,36 +661,41 @@ elif app_mode == "Disease Recognition":
 
             st.snow()
 
-            # Check if the image looks like a plant/leaf
+            # Validate if the image is actually a plant/leaf
             test_image.seek(0)  # Reset file pointer
-            plant_check = is_likely_plant_image(test_image)
-            test_image.seek(0)  # Reset file pointer again for model
+            is_valid, fail_reason = validate_plant_image(test_image)
+            test_image.seek(0)  # Reset file pointer for model
 
-            result_index, confidence = model_prediction(test_image)
-            test_image.seek(0)  # Reset for displaying
-
-            # Confidence threshold — if the model is unsure, the image
-            # is likely not a valid plant leaf
-            CONFIDENCE_THRESHOLD = 0.50
-
-            if confidence < CONFIDENCE_THRESHOLD or not plant_check:
+            if not is_valid:
                 # Irrelevant image detected — warn the user
                 st.image(
                     test_image,
                     caption="Uploaded Image",
                     width="stretch"
                 )
+
+                # Show specific reason-based message
+                if fail_reason == "color":
+                    detail = "The image doesn't contain enough plant/leaf colors."
+                elif fail_reason == "texture":
+                    detail = "The image lacks the natural texture patterns found in plant leaves."
+                else:  # consistency
+                    detail = "The image doesn't appear to be a recognizable plant leaf."
+
                 st.warning(
                     "⚠️ **This doesn't look like a valid plant leaf image!**\n\n"
+                    f"**Reason:** {detail}\n\n"
                     "Please upload a clear image of a **plant leaf** for accurate disease detection.\n\n"
                     "**Tips for best results:**\n"
                     "- Upload a close-up photo of a single leaf\n"
                     "- Make sure the leaf is clearly visible and well-lit\n"
-                    "- Avoid uploading images of non-plant objects (cars, people, animals, etc.)\n\n"
-                    f"*Model confidence: {confidence * 100:.1f}%*"
+                    "- Avoid uploading images of non-plant objects (cars, people, animals, etc.)"
                 )
             else:
                 # Valid plant image — proceed with prediction
+                result_index, confidence = model_prediction(test_image)
+                test_image.seek(0)  # Reset for displaying
+
                 # Parse the predicted class name
                 predicted_class = class_name[result_index]
                 parts = predicted_class.split("___")
